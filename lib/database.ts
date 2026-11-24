@@ -1,6 +1,7 @@
 import { createClient, type Client, type InValue } from '@libsql/client';
 import { schema } from './schema';
 import { Pool, types } from 'pg';
+import { supabaseCa } from './supabase-ca';
 types.setTypeParser(20, Number);
 type Input = {sql:string; args:InValue[]};
 function statement(input:Input) {
@@ -43,7 +44,22 @@ export function databaseClient() {
 export async function getDatabase() {
   const url = process.env.POSTGRES_URL || process.env.DATABASE_URL;
   if (url) {
-    postgres ??= new Postgres(new Pool({connectionString:url, max:2, connectionTimeoutMillis:5000}));
+    if (!postgres) {
+      const connection = new URL(url);
+      const isSupabasePooler = connection.hostname.endsWith('.pooler.supabase.com');
+      if (isSupabasePooler) {
+        // URL parameters would override the verified TLS configuration below.
+        for (const key of ['ssl', 'sslmode', 'sslcert', 'sslkey', 'sslrootcert']) {
+          connection.searchParams.delete(key);
+        }
+      }
+      postgres = new Postgres(new Pool({
+        connectionString: connection.toString(),
+        max: 2,
+        connectionTimeoutMillis: 5000,
+        ...(isSupabasePooler ? {ssl: {ca: supabaseCa, rejectUnauthorized: true}} : {}),
+      }));
+    }
     return new Database(postgres);
   }
   if (process.env.VERCEL) throw new Error('Set POSTGRES_URL to the Supabase transaction pooler URL.');
