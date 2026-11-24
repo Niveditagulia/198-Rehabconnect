@@ -8,7 +8,6 @@ import {
   Clock,
   LayoutDashboard,
   Play,
-  Pause,
   Users,
   History,
   Settings2,
@@ -28,8 +27,7 @@ import Figure from "../components/exercise-figure";
 import SignOutButton from "./signout-button";
 import { useUsbSensor } from "../lib/use-usb-sensor";
 import {
-  thresholdStep,
-  freshThreshold,
+  counterDelta,
   type Reading,
 } from "../lib/sensor-protocol";
 import {
@@ -103,33 +101,30 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
   const current = useRef<ExerciseSession | null>(null),
     run = useRef(false),
     baseline = useRef<Reading | null>(null),
-    threshold = useRef(freshThreshold()),
+    [finishing, setFinishing] = useState(false),
     lock = useRef<Promise<void> | null>(null),
     loaded = useRef(false);
-  current.current = session;
-  run.current = running;
   const updateSession = (fn: (s: ExerciseSession) => ExerciseSession) => {
     if (!current.current) return;
     current.current = fn(current.current);
     setSession(current.current);
   };
-  const usb = useUsbSensor((next, packetPrevious) => {
-    const previous = packetPrevious ? baseline.current : null;
+  function holdSession() {
+    baseline.current = null;
+    run.current = false;
+    setRunning(false);
+  }
+  const usb = useUsbSensor((next) => {
+    if (!run.current || !current.current || !baseline.current) return;
+    const previous = baseline.current;
+    const delta = counterDelta(previous, next);
+    if (delta === null) { holdSession(); return; }
     baseline.current = next;
-    if (!run.current || !current.current) return;
-    if (!previous) threshold.current = freshThreshold();
-    const measured = thresholdStep(threshold.current, next, true);
-    threshold.current = measured.state;
-    const delta = measured.delta;
-    updateSession((s) => ({
-      ...s,
-      reps: s.reps + delta,
-    }));
-  });
-  const sensorReady =
-    usb.connected && !usb.stale && !!usb.reading?.movementValid;
-  const readyRef = useRef(false);
-  readyRef.current = sensorReady;
+    if (delta) updateSession(s => ({...s, reps: s.reps + delta}));
+    if (previous.state !== "paused" && next.state === "paused") void sync();
+  }, holdSession);
+  const fresh = usb.connected && !usb.stale && !!usb.reading;
+  const sensorReady = fresh && usb.reading?.state === "running";
   const refresh = useCallback(async () => {
     try {
       const next = (await api()) as unknown as AppData;
@@ -168,28 +163,16 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
     return () => clearInterval(t);
   }, [refresh]);
   useEffect(() => {
-    
-  }, []);
-  useEffect(() => {
-    if (!running || !session) return;
-    const t = setInterval(() => {
-      if (readyRef.current)
-        updateSession((s) => ({
-          ...s,
-          seconds: Math.min(86400, s.seconds + 1),
-        }));
+    if (!running || !sensorReady) return;
+    const timer = setInterval(() => {
+      if (run.current && usb.snapshot()?.state === "running")
+        updateSession(s => ({...s, seconds: Math.min(86400, s.seconds + 1)}));
     }, 1000);
-    return () => clearInterval(t);
-  }, [running, session?.id]);
-  useEffect(() => {
-    if (!sensorReady) {
-      baseline.current = null;
-      threshold.current = freshThreshold();
-    }
-  }, [sensorReady]);
+    return () => clearInterval(timer);
+  }, [running, sensorReady, session?.id]);
   const sync = useCallback(
     async (finish = false) => {
-      if (lock.current) await lock.current;
+      while (lock.current) await lock.current;
       const snap = current.current;
       if (!snap) return;
       let failed = false;
@@ -204,16 +187,17 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
             heart: snap.heart,
             status: finish
               ? "finished"
-              : run.current && readyRef.current
+              : run.current && baseline.current?.state === "running"
                 ? "active"
                 : "paused",
-            connection: readyRef.current ? "connected" : "disconnected",
+            connection: usb.snapshot() ? "connected" : "disconnected",
           });
           setLastSaved(Date.now());
           setSyncError("");
           if (finish) {
             current.current = null;
             setSession(null);
+            setFinishing(false);
             setRunning(false);
             setSelected(saved.session);
             setTab("Exercise history");
@@ -244,10 +228,10 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
   );
   useEffect(() => {
     const t = setInterval(() => {
-      if (current.current && !lock.current) void sync();
+      if (current.current && !lock.current && !finishing) void sync();
     }, 3000);
     return () => clearInterval(t);
-  }, [sync]);
+  }, [sync, finishing]);
   useEffect(() => {
     const guard = (e: BeforeUnloadEvent) => {
       if (current.current) {
@@ -293,11 +277,12 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
         id: crypto.randomUUID(),
         prescriptionId: p.id,
       });
-      baseline.current = null;
+      const startPacket = usb.snapshot();
+      baseline.current = startPacket?.state === "running" ? startPacket : null;
       current.current = result.session;
       setSession(result.session);
-      setRunning(true);
-      run.current = true;
+      run.current = !!baseline.current;
+      setRunning(run.current);
       setTab("Live session");
       setDetail(null);
       setSyncError("");
@@ -308,27 +293,17 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
       setBusy(false);
     }
   }
-  async function pause() {
-    run.current = false;
-    setRunning(false);
-    baseline.current = null;
-    await sync();
-  }
   async function finish() {
-    run.current = false;
-    setRunning(false);
+    holdSession();
+    setFinishing(true);
     setBusy(true);
     await sync(true);
     setBusy(false);
   }
   function resume() {
-    if (!sensorReady) {
-      setSyncError(
-        "Reconnect the sensor and wait for valid movement readings first.",
-      );
-      return;
-    }
-    baseline.current = null;
+    const packet = usb.snapshot();
+    if (finishing || packet?.state !== "running") return;
+    baseline.current = packet;
     run.current = true;
     setRunning(true);
     setSyncError("");
@@ -487,7 +462,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
               <p>
                 {clinician
                   ? "Only patients who connect with you appear here."
-                  : "A rep counts when the equipment’s vertical acceleration reaches 2 m/s²."}
+                  : "Reps come from the tracker attached to your equipment."}
               </p>
             </div>
             <div className="profile">
@@ -715,7 +690,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                           Sensor connection <Radio size={17} />
                         </span>
                         <div className="connection-value">
-                          {sensorReady ? "USB connected" : "Not connected"}
+                          {fresh ? "USB connected" : "Not connected"}
                         </div>
                         <button
                           className="text-button"
@@ -908,7 +883,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                       <h3>Consistency over intensity.</h3>
                       <p>
                         Follow your prescribed plan. The sensor measures the
-                        equipment’s vertical movement; it does not confirm
+                        equipment movement; it does not confirm
                         correct technique.
                       </p>
                     </section>
@@ -1254,7 +1229,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                       <h2>Sensor measurement</h2>
                       <div className="chart-empty">
                         <Activity size={24} />
-                        <p>Reps are measured from vertical equipment movement.</p>
+                        <p>Reps are measured from equipment movement recorded by the Arduino.</p>
                       </div>
                     </section>
                   </div>
@@ -1320,7 +1295,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                       {running
                         ? sensorReady
                           ? "Recording"
-                          : "Waiting for sensor"
+                          : usb.reading?.state === "paused" ? "Paused on tracker" : "Calibrating"
                         : "Paused"}
                     </span>
                   </div>
@@ -1328,10 +1303,10 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                   {syncError && (
                     <div className="warning" role="alert">
                       {syncError} Your current readings remain on this page.{" "}
-                      <button onClick={() => void sync()}>Retry save</button>
+                      <button disabled={busy} onClick={() => finishing ? void finish() : void sync()}>Retry save</button>
                     </div>
                   )}
-                  {!sensorReady && (
+                  {!fresh && (
                     <div className="warning" role="alert">
                       No valid movement stream. Repetition counting and the
                       timer are paused.
@@ -1353,13 +1328,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                         <small> / {session.target}</small>
                       </div>
                       <p className="center-note">
-                        vertical threshold 2 m/s² ·{" "}
-                        {sensorReady
-                          ? usb.reading?.acceleration?.toFixed(2)
-                          : "—"}{" "}
-                        m/s² now
-                        <br />
-                        repetitions ·{" "}
+                        Session repetitions ·{" "}
                         {Math.round((session.reps / session.target) * 100)}% of
                         target
                       </p>
@@ -1385,10 +1354,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                         <div>
                           <Activity size={19} />
                           <strong>
-                            {sensorReady
-                              ? usb.reading?.acceleration?.toFixed(2)
-                              : "—"}{" "}
-                            <small>m/s² vertical</small>
+                            {fresh ? usb.reading?.setReps : "—"} <small>current set</small>
                           </strong>
                         </div>
                         <div>
@@ -1403,7 +1369,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                         <Radio size={24} />
                         <p>Attach the sensor securely to the moving ball, weight, bar, or approved cable attachment—not to the patient.</p>
                       </div>
-                      <p className="muted">Only vertical movement is supported. Curved movement is not counted reliably.</p>
+                      <p className="muted">Press the black button to pause the tracker. Press again and hold still to start a new set.</p>
                     </div>
                   </div>
                   <div className="live-footer">
@@ -1413,14 +1379,9 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                         : "Auto-save every 3 seconds"}
                     </span>
                     <div className="modal-actions">
-                      <button
-                        className="secondary"
-                        disabled={busy || (!running && !sensorReady)}
-                        onClick={() => (running ? void pause() : resume())}
-                      >
-                        {running ? <Pause size={16} /> : <Play size={16} />}{" "}
-                        {running ? "Pause" : "Resume"}
-                      </button>
+                      {!running && !finishing && <button className="secondary" disabled={busy || !sensorReady} onClick={resume}>
+                        Continue from current tracker count
+                      </button>}
                       <button
                         className="primary"
                         disabled={busy}
@@ -1474,16 +1435,16 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                     </div>
                   )}
                   <div className="device-line">
-                    <span>Vertical movement stream</span>
+                    <span>Tracker state</span>
                     <span className="soft-tag">
-                      {sensorReady ? "Valid readings" : "Unavailable"}
+                      {fresh ? usb.reading?.state : usb.connected ? "Waiting for tracker" : "Disconnected"}
                     </span>
                   </div>
                   <div className="device-line">
-                    <span>Vertical acceleration</span>
+                    <span>Current set reps</span>
                     <span className="soft-tag">
-                      {sensorReady
-                        ? usb.reading?.acceleration?.toFixed(2) + " m/s²"
+                      {fresh
+                        ? usb.reading?.setReps
                         : "Unavailable"}
                     </span>
                   </div>
@@ -1502,9 +1463,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                     </div>
                   )}
                   <p className="muted">
-                    There is no automatic or simulated rep counter. A rep counts
-                    when the equipment’s vertical acceleration reaches 2 m/s².
-                    It must return below 1 m/s² before another rep can count.
+                    The current set matches the OLED. Your session total includes reps from each set after you start tracking.
                   </p>
                 </section>
                 <section className="panel">
@@ -1529,15 +1488,14 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                     </li>
                   </ol>
                   <p>
-                    Calibrated vertical-acceleration firmware must be loaded
-                    onto the Arduino. Curved movements are not supported.
+                    Upload the tracker sketch to the UNO R4 Minima using Arduino IDE.
                   </p>
                   <a
                     className="secondary"
-                    href="/arduino/rehab_usb_protocol.ino"
+                    href="/arduino/RehabConnect_Tracker/RehabConnect_Tracker.ino"
                     download
                   >
-                    <Download size={16} /> Firmware protocol template
+                    <Download size={16} /> Download tracker sketch
                   </a>
                   <p className="muted">
                     The current build measures equipment movement only and does
@@ -1548,9 +1506,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                   <h2>Connection feedback</h2>
                   <p>
                     Missing, repeated, or invalid packets are ignored. The timer
-                    pauses when movement readings are unavailable. The next
-                    valid packet establishes a fresh baseline so missed or
-                    paused movement is not counted.
+                    pauses when movement readings are unavailable. After reconnecting, select Continue to resume from the current board count.
                   </p>
                 </section>
               </div>

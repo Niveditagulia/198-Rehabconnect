@@ -46,6 +46,6 @@ The integration test uses synthetic accounts on localhost and checks both logins
 
 ## USB hardware
 
-Connect the UNO R4 Minima at 115200 baud using desktop Chrome or Edge over HTTPS or localhost. Attach the sensor to the moving equipment. Firmware must send newline-delimited JSON matching `public/arduino/rehab_usb_protocol.ino`. Reps count on vertical acceleration reaching 2 m/s², rearm below 1 m/s², and debounce for 500 ms. No pulse oximeter is used. Physical calibration and USB testing with your actual board are still required.
+Connect the UNO R4 Minima at 115200 baud using desktop Chrome or Edge over HTTPS or localhost. Attach the sensor to the moving equipment. Upload the included `public/arduino/RehabConnect_Tracker/RehabConnect_Tracker.ino` with Arduino IDE (Renesas UNO core, Adafruit GFX and SSD1306). Close Serial Monitor before selecting the port in the patient dashboard. The browser sends HELLO followed by a space and a connection UUID. The tracker echoes that UUID in newline-delimited JSON snapshots. The website counts changes in the board's cumulative rep count during a session. Press the black button to pause or start a new set. After a USB interruption, explicitly continue from a fresh baseline. Check five reps in one set plus three in a second set against a saved session total of eight.
 
 The original hosted ChatGPT Site and its database have not been changed by this export.
