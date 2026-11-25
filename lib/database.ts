@@ -7,8 +7,7 @@ type Input = {sql:string; args:InValue[]};
 function statement(input:Input) {
   let position = 0;
   return {
-    text: input.sql.replace(/\?/g, () => '$' + ++position)
-      .replace(/\bAS (\w*[A-Z]\w*)/g, 'AS "$1"'),
+    text: input.sql.replace(/\?/g, () => '$' + ++position),
     values: input.args,
   };
 }

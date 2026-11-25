@@ -10,11 +10,11 @@ import type {
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 const profileCols =
-  "id,name,email,role,care_code AS careCode,therapist_id AS therapistId,created_at AS createdAt";
+  `id,name,email,role,care_code AS "careCode",therapist_id AS "therapistId",created_at AS "createdAt"`;
 const prescriptionCols =
-  "id,patient_id AS patientId,therapist_id AS therapistId,name,instructions,reps,sets,minutes,active,created_at AS createdAt";
+  `id,patient_id AS "patientId",therapist_id AS "therapistId",name,instructions,reps,sets,minutes,active,created_at AS "createdAt"`;
 const sessionCols =
-  "id,patient_id AS patientId,prescription_id AS prescriptionId,exercise,instructions,target,reps,seconds,status,started_at AS startedAt,updated_at AS updatedAt,finished_at AS finishedAt,heart,connection,revision";
+  `id,patient_id AS "patientId",prescription_id AS "prescriptionId",exercise,instructions,target,reps,seconds,status,started_at AS "startedAt",updated_at AS "updatedAt",finished_at AS "finishedAt",heart,connection,revision`;
 class HttpError extends Error {
   constructor(
     public status: number,
@@ -266,7 +266,7 @@ export async function POST(request: Request) {
         const id = uuid.parse(input.id);
         const p = await db
           .prepare(
-            "SELECT patient_id AS patientId,therapist_id AS therapistId FROM prescriptions WHERE id=?",
+            `SELECT patient_id AS "patientId",therapist_id AS "therapistId" FROM prescriptions WHERE id=?`,
           )
           .bind(id)
           .first<Prescription>();

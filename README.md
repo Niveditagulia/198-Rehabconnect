@@ -5,13 +5,14 @@ This folder is the complete Next.js application to import into Vercel. It includ
 ## Run on your computer
 
 ```sh
-cd /Users/Nivedita/Desktop/198/rehabconnect-vercel
 npm ci
+cp .env.example .env.local
+# Set AUTH_SECRET and THERAPIST_INVITE_CODE to separate random secrets in .env.local.
 npm run db:setup
 npm run dev
 ```
 
-Open http://localhost:3000. A local `.env.local` has already been generated with random development secrets and a local database URL. Open that file to find `THERAPIST_INVITE_CODE` when creating your physiotherapist account. No real user account is pre-created; use **Create an account** to register your email and a password of at least 12 characters.
+Run these commands from the repository root on a fresh checkout. Keep any existing local configuration. Open http://localhost:3000. The invite code is required for physiotherapist registration. Use **Create an account** to register an email and a password of at least 12 characters.
 
 Patient and physiotherapist accounts are separate. You may register the same email for both account types; the physiotherapist account additionally requires the invitation code. Select the account type you registered when logging in. A patient session cannot switch into the clinician workspace.
 

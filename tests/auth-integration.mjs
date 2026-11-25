@@ -173,11 +173,33 @@ const completed = await call(patient, {
 });
 assert.equal(completed.session.target, 2);
 assert.equal(completed.session.status, "completed");
+const selectionCases = [
+  { name: "Deadlift", reps: 8, sets: 5 },
+  { name: "Ball squat", reps: 10, sets: 2 },
+];
+for (const exercise of selectionCases) {
+  await call(doctor, { ...prescription, ...exercise });
+}
+const plan = (await call(patient)).prescriptions;
+for (const exercise of selectionCases) {
+  const selected = plan.find((item) => item.name === exercise.name);
+  assert.ok(selected);
+  const id = crypto.randomUUID();
+  const { session } = await call(patient, { action: "start", id, prescriptionId: selected.id }, 201);
+  assert.equal(session.exercise, exercise.name);
+  assert.equal(session.target, exercise.reps * exercise.sets);
+  await call(patient, { ...update, id, revision: 0, reps: 1, seconds: 3, heart: [], status: "finished" });
+  const saved = (await call(patient)).sessions.find((item) => item.id === id);
+  assert.equal(saved.prescriptionId, selected.id);
+  assert.equal(saved.exercise, exercise.name);
+  assert.equal(saved.reps, 1);
+  assert.equal(saved.status, "incomplete");
+}
 await call(patient, { action: "unlink" });
 assert.equal((await call(doctor)).patients.length, 0);
 assert.equal((await call(doctor)).sessions.length, 0);
 const final = await call(patient);
-assert.equal(final.sessions.length, 2);
+assert.equal(final.sessions.length, 4);
 assert.ok(final.prescriptions.every((p) => p.active === 0));
 
 const cookieBeforeLogout=sessions.get(patient);

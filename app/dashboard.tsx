@@ -22,6 +22,7 @@ import {
   AlertCircle,
   RefreshCw,
   Copy,
+  Dumbbell,
 } from "lucide-react";
 import Figure from "../components/exercise-figure";
 import SignOutButton from "./signout-button";
@@ -38,6 +39,9 @@ import {
   type Prescription,
   type ExerciseSession,
 } from "../lib/models";
+class AppError extends Error {
+  constructor(readonly status: number, message: string) { super(message); }
+}
 function selectedRole(): "patient" | "physiotherapist" {
   return typeof window !== "undefined" && window.location.pathname === "/physiotherapist" ? "physiotherapist" : "patient";
 }
@@ -56,7 +60,7 @@ async function api(body?: unknown) {
     session: ExerciseSession;
     therapist: { id: string; name: string; email: string };
   };
-  if (!r.ok) throw new Error(data.error || "Request failed. Please try again.");
+  if (!r.ok) throw new AppError(r.status, data.error || "Request failed. Please try again.");
   return data;
 }
 const duration = (seconds: number) =>
@@ -65,6 +69,8 @@ const label = (s: ExerciseSession) =>
   isOpen(s)
     ? Date.now() - s.updatedAt > 12000
       ? "Interrupted"
+      : s.connection === "disconnected"
+        ? "Tracker disconnected"
       : s.status === "active"
         ? "In progress"
         : "Paused"
@@ -77,6 +83,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
   const [data, setData] = useState<AppData | null>(null),
     [loading, setLoading] = useState(true),
     [error, setError] = useState(""),
+    [refreshError, setRefreshError] = useState(""),
     [notice, setNotice] = useState(""),
     [busy, setBusy] = useState(false),
     [tab, setTab] = useState("Overview"),
@@ -86,6 +93,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
     [filter, setFilter] = useState("all"),
     [selected, setSelected] = useState<ExerciseSession | null>(null),
     [detail, setDetail] = useState<Prescription | null>(null),
+    [pendingExerciseId, setPendingExerciseId] = useState(""),
     [editor, setEditor] = useState<Partial<Prescription> | null>(null),
     [session, setSession] = useState<ExerciseSession | null>(null),
     [running, setRunning] = useState(false),
@@ -99,6 +107,8 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
     } | null>(null),
     [careCode, setCareCode] = useState("");
   const current = useRef<ExerciseSession | null>(null),
+    writesSession = useRef(false),
+    refreshSequence = useRef(0),
     run = useRef(false),
     baseline = useRef<Reading | null>(null),
     [finishing, setFinishing] = useState(false),
@@ -126,34 +136,42 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
   const fresh = usb.connected && !usb.stale && !!usb.reading;
   const sensorReady = fresh && usb.reading?.state === "running";
   const refresh = useCallback(async () => {
+    const sequence = ++refreshSequence.current;
     try {
       const next = (await api()) as unknown as AppData;
+      if (sequence !== refreshSequence.current) return;
       setData(next);
       setPatientId((id) => id || next.profile?.id || "");
-      if (!loaded.current && next.profile?.role === "patient") {
+      if (!writesSession.current && !lock.current && next.profile?.role === "patient") {
         const open = next.sessions.find(isOpen);
         if (open) {
+          const firstLoad = !loaded.current;
           setSession(open);
           current.current = open;
           setRunning(false);
-          setTab("Live session");
-          setNotice(
-            "Your saved session is ready to resume. Reconnect your sensor first.",
-          );
+          if (firstLoad) {
+            setTab("Live session");
+            setNotice("A session is open. Continue here if this is the tracking tab.");
+          }
+        } else if (current.current) {
+          current.current = null;
+          setSession(null);
+          setFinishing(false);
         }
       }
       loaded.current = true;
-      setError("");
+      setRefreshError("");
     } catch (e) {
-      setError((e as Error).message);
+      if (sequence !== refreshSequence.current) return;
+      setRefreshError((e as Error).message);
     } finally {
-      setLoading(false);
+      if (sequence === refreshSequence.current) setLoading(false);
     }
   }, []);
   useEffect(() => {
     setSelected((previous) =>
       previous
-        ? data?.sessions.find((s) => s.id === previous.id) || previous
+        ? data?.sessions.find((s) => s.id === previous.id) || null
         : null,
     );
   }, [data]);
@@ -171,10 +189,10 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
     return () => clearInterval(timer);
   }, [running, sensorReady, session?.id]);
   const sync = useCallback(
-    async (finish = false) => {
+    async (finish = false, leaving = false) => {
       while (lock.current) await lock.current;
       const snap = current.current;
-      if (!snap) return;
+      if (!snap || (!finish && !writesSession.current)) return;
       let failed = false;
       const task = (async () => {
         try {
@@ -190,11 +208,12 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
               : run.current && baseline.current?.state === "running"
                 ? "active"
                 : "paused",
-            connection: usb.snapshot() ? "connected" : "disconnected",
+            connection: !leaving && usb.snapshot() ? "connected" : "disconnected",
           });
           setLastSaved(Date.now());
           setSyncError("");
           if (finish) {
+            writesSession.current = false;
             current.current = null;
             setSession(null);
             setFinishing(false);
@@ -213,9 +232,10 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
         } catch (e) {
           failed = true;
           setSyncError((e as Error).message);
-          if ((e as Error).message.includes("another tab")) {
-            run.current = false;
-            setRunning(false);
+          if (e instanceof AppError && e.status === 409) {
+            writesSession.current = false;
+            holdSession();
+            setFinishing(false);
           }
         }
       })();
@@ -228,13 +248,13 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
   );
   useEffect(() => {
     const t = setInterval(() => {
-      if (current.current && !lock.current && !finishing) void sync();
+      if (writesSession.current && current.current && !lock.current && !finishing) void sync();
     }, 3000);
     return () => clearInterval(t);
   }, [sync, finishing]);
   useEffect(() => {
     const guard = (e: BeforeUnloadEvent) => {
-      if (current.current) {
+      if (writesSession.current && current.current) {
         e.preventDefault();
         e.returnValue = "";
       }
@@ -258,15 +278,14 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
     }
   }
   async function start(p: Prescription) {
+    setError("");
+    setDetail(null);
     if (session) {
       setTab("Live session");
       return;
     }
     if (!sensorReady) {
-      setError(
-        "Connect your Arduino and wait for valid movement readings before starting.",
-      );
-      setDetail(null);
+      setPendingExerciseId(p.id);
       setTab("Device connection");
       return;
     }
@@ -278,13 +297,14 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
         prescriptionId: p.id,
       });
       const startPacket = usb.snapshot();
+      setPendingExerciseId("");
+      writesSession.current = true;
       baseline.current = startPacket?.state === "running" ? startPacket : null;
       current.current = result.session;
       setSession(result.session);
       run.current = !!baseline.current;
       setRunning(run.current);
       setTab("Live session");
-      setDetail(null);
       setSyncError("");
       await refresh();
     } catch (e) {
@@ -304,6 +324,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
     const packet = usb.snapshot();
     if (finishing || packet?.state !== "running") return;
     baseline.current = packet;
+    writesSession.current = true;
     run.current = true;
     setRunning(true);
     setSyncError("");
@@ -341,6 +362,19 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
         Date.now() - s.startedAt < Number(range) * 86400000) &&
       (filter === "all" || s.status === filter),
   );
+  const pendingExercise = plan.find(p => p.id === pendingExerciseId);
+  const preferenceKey = profile && "rehabconnect.largeText." + profile.id;
+  useEffect(() => {
+    try { setLargeText(!!preferenceKey && localStorage.getItem(preferenceKey) === "true"); }
+    catch { setLargeText(false); }
+  }, [preferenceKey]);
+  async function saveBeforeSignOut() {
+    if (!current.current || !writesSession.current) return true;
+    holdSession();
+    const saved = await sync(finishing, true);
+    if (saved) writesSession.current = false;
+    return saved === true;
+  }
   const exportRecords = () => {
     const blob = new Blob(
       [
@@ -364,7 +398,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
     URL.revokeObjectURL(url);
   };
   const exerciseStatus = (p: Prescription) =>
-    session?.prescriptionId === p.id
+    own.some(s => s.prescriptionId === p.id && isOpen(s)) || session?.prescriptionId === p.id
       ? "In progress"
       : done.has(p.id)
         ? "Completed"
@@ -383,7 +417,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
       <div className="app-loading">
         <AlertCircle size={32} />
         <h2>Unable to open your workspace</h2>
-        <p>{error}</p>
+        <p>{refreshError || error}</p>
         <button
           className="primary"
           onClick={() => {
@@ -478,7 +512,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                 <small>{clinician ? "Physiotherapist" : "Patient"}</small>
               </div>
             </div>
-            <SignOutButton className="logout-link"/>
+            <SignOutButton className="logout-link" beforeSignOut={saveBeforeSignOut}/>
           </div>
         </aside>
         <div className="main-shell">
@@ -492,7 +526,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
               </span>
               <span className="avatar">{profile.name[0]}</span>
               <span className="workspace-switch">{clinician ? "Physiotherapist" : "Patient"} workspace</span>
-              <SignOutButton className="topbar-logout"/>
+              <SignOutButton className="topbar-logout" beforeSignOut={saveBeforeSignOut}/>
             </div>
           </header>
           <main id="main-content">
@@ -534,11 +568,11 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                 </span>
               </div>
             </div>
-            {error && (
+            {(error || refreshError) && (
               <div className="warning app-alert" role="alert">
                 <AlertCircle size={17} />
-                <span>{error}</span>
-                <button onClick={() => setError("")} aria-label="Dismiss error">
+                <span>{error || refreshError}</span>
+                <button onClick={() => error ? setError("") : setRefreshError("")} aria-label="Dismiss error">
                   <X size={15} />
                 </button>
               </div>
@@ -634,8 +668,8 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                                 .filter(
                                   (s) =>
                                     s.status === "incomplete" ||
-                                    (isOpen(s) &&
-                                      Date.now() - s.updatedAt > 12000),
+                                    (isOpen(s) && (s.connection === "disconnected" ||
+                                      Date.now() - s.updatedAt > 12000)),
                                 )
                                 .map((s) => s.patientId),
                             ).size
@@ -755,7 +789,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                             ? "Assign clear targets and review measured results."
                             : session
                               ? "You have a saved session to resume."
-                              : "Connect your sensor to begin recording."}
+                              : sensorReady ? "Select an assigned exercise to begin recording." : "Connect your sensor to begin recording."}
                         </p>
                         <button
                           className="primary"
@@ -765,7 +799,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                                 ? "Assign exercises"
                                 : session
                                   ? "Live session"
-                                  : "Device connection",
+                                  : sensorReady ? "My exercises" : "Device connection",
                             )
                           }
                         >
@@ -774,7 +808,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                             ? "Manage prescriptions"
                             : session
                               ? "Resume session"
-                              : "Connect your sensor"}
+                              : sensorReady ? "Choose an exercise" : "Connect your sensor"}
                         </button>
                       </div>
                       <div className="hero-art">
@@ -790,7 +824,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                         {plan.map((p, i) => (
                           <article className="exercise-card" key={p.id}>
                             <div className={"exercise-art art-" + (i % 3)}>
-                              <Figure kind={(i % 3) + 1} />
+                              <Dumbbell aria-hidden="true" />
                             </div>
                             <div className="exercise-info">
                               <span className="eyebrow">
@@ -990,9 +1024,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                       const ps = data.sessions.filter(
                           (s) => s.patientId === p.id,
                         ),
-                        live = ps.find(
-                          (s) => isOpen(s) && Date.now() - s.updatedAt < 12000,
-                        ),
+                        live = ps.find(isOpen),
                         completed = ps.filter(
                           (s) => s.status === "completed",
                         ).length;
@@ -1071,7 +1103,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                   {plan.map((p, i) => (
                     <article className="panel library-card" key={p.id}>
                       <div className={"exercise-art art-" + (i % 3)}>
-                        <Figure kind={(i % 3) + 1} />
+                        <Dumbbell aria-hidden="true" />
                       </div>
                       <span
                         className={
@@ -1141,7 +1173,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                 <div className="section-heading section-spaced">
                   <div>
                     <h2>{actualPatient?.name || "Patient"}’s activity</h2>
-                    <p>Recorded results, with no simulated measurements.</p>
+                    <p>Saved session totals and progress against the prescribed target.</p>
                   </div>
                   <button
                     className="secondary"
@@ -1229,7 +1261,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                       <h2>Sensor measurement</h2>
                       <div className="chart-empty">
                         <Activity size={24} />
-                        <p>Reps are measured from equipment movement recorded by the Arduino.</p>
+                        <p>The Arduino counts changes in acceleration. Session completion compares total counted reps with the prescribed target. It does not verify set structure, distance or exercise technique.</p>
                       </div>
                     </section>
                   </div>
@@ -1296,7 +1328,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                         ? sensorReady
                           ? "Recording"
                           : usb.reading?.state === "paused" ? "Paused on tracker" : "Calibrating"
-                        : "Paused"}
+                        : writesSession.current ? "Paused" : "Viewing saved session"}
                     </span>
                   </div>
                   <p>{session.instructions}</p>
@@ -1367,7 +1399,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                       <h3>Equipment sensor placement</h3>
                       <div className="chart-empty">
                         <Radio size={24} />
-                        <p>Attach the sensor securely to the moving ball, weight, bar, or approved cable attachment—not to the patient.</p>
+                        <p>Attach the tracker to the moving equipment. Press black to pause the set. Press it again and hold still to start a new set. Finish &amp; save closes the website session.</p>
                       </div>
                       <p className="muted">Press the black button to pause the tracker. Press again and hold still to start a new set.</p>
                     </div>
@@ -1433,6 +1465,16 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                     <div className="warning" role="alert">
                       {usb.error}
                     </div>
+                  )}
+                  {!session && pendingExercise && (
+                    <button className="secondary" disabled={!sensorReady || busy} onClick={() => void start(pendingExercise)}>
+                      Start {pendingExercise.name}
+                    </button>
+                  )}
+                  {sensorReady && (session || !pendingExercise) && (
+                    <button className="secondary" onClick={() => setTab(session ? "Live session" : "My exercises")}>
+                      {session ? "Return to live session" : "Choose an exercise"}
+                    </button>
                   )}
                   <div className="device-line">
                     <span>Tracker state</span>
@@ -1550,11 +1592,15 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                     <input
                       type="checkbox"
                       checked={largeText}
-                      onChange={(e) => setLargeText(e.target.checked)}
+                      onChange={(e) => {
+                        setLargeText(e.target.checked);
+                        try { if (preferenceKey) localStorage.setItem(preferenceKey, String(e.target.checked)); }
+                        catch { /* The preference still applies for this visit. */ }
+                      }}
                     />{" "}
                     Larger text
                   </label>
-                  <SignOutButton className="secondary"/>
+                  <SignOutButton className="secondary" beforeSignOut={saveBeforeSignOut}/>
                 </section>
                 <section className="panel">
                   <h2>
@@ -1668,8 +1714,8 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                 <section className="panel">
                   <h2>Account security and records</h2>
                   <p>
-                    Your account provider handles credentials and password
-                    recovery. Records are saved in the application database and
+                    RehabConnect manages this account. Self-service password
+                    recovery is unavailable. Records are saved in the application database and
                     access is checked on the server for every request.
                   </p>
                   <p>
@@ -1709,7 +1755,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                 <X />
               </button>
               <div className="detail-art">
-                <Figure />
+                <Dumbbell aria-hidden="true" />
               </div>
               <h2 id="detail-title">{detail.name}</h2>
               <p>{detail.instructions}</p>
@@ -1910,7 +1956,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                 </div>
               </div>
               <p className="muted">
-                Vertical equipment-movement data · Updated{" "}
+                Equipment movement count · Updated{" "}
                 {new Date(selected.updatedAt).toLocaleTimeString()}
               </p>
               {isOpen(selected) && (

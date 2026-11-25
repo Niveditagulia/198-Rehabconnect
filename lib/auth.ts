@@ -46,7 +46,7 @@ export async function getUser(): Promise<AuthUser | null> {
   const payload = await sessionPayload();
   if (!payload?.sub || !payload.jti) return null;
   const db = await getDatabase();
-  const user = await db.prepare(`SELECT a.id AS userId,a.email,a.role,p.name AS displayName FROM accounts a JOIN profiles p ON p.id=a.id JOIN auth_sessions s ON s.account_id=a.id WHERE s.id=? AND a.id=? AND s.expires_at>?`).bind(payload.jti, payload.sub, Date.now()).first<AuthUser>();
+  const user = await db.prepare(`SELECT a.id AS "userId",a.email,a.role,p.name AS "displayName" FROM accounts a JOIN profiles p ON p.id=a.id JOIN auth_sessions s ON s.account_id=a.id WHERE s.id=? AND a.id=? AND s.expires_at>?`).bind(payload.jti, payload.sub, Date.now()).first<AuthUser>();
   return user?.role === payload.role ? user : null;
 }
 export async function endSession() {
