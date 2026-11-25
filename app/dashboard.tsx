@@ -21,7 +21,6 @@ import {
   ShieldCheck,
   AlertCircle,
   RefreshCw,
-  Copy,
   Dumbbell,
 } from "lucide-react";
 import { advanceSets, creditedSets, resumePlan, FRESH_SET_MESSAGE } from "../lib/set-progress";
@@ -111,12 +110,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
     [syncConflict, setSyncConflict] = useState(false),
     [lastSaved, setLastSaved] = useState(0),
     [largeText, setLargeText] = useState(false),
-    [pairing, setPairing] = useState<{
-      id: string;
-      name: string;
-      email: string;
-    } | null>(null),
-    [careCode, setCareCode] = useState("");
+    [patientEmail, setPatientEmail] = useState("");
   const current = useRef<ExerciseSession | null>(null),
     writesSession = useRef(false),
     refreshSequence = useRef(0),
@@ -538,7 +532,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
               <strong>Your care, connected.</strong>
               <p>
                 {clinician
-                  ? "Only patients who connect with you appear here."
+                  ? "Only patients you add by email appear here."
                   : "Reps come from the tracker attached to your equipment."}
               </p>
             </div>
@@ -659,7 +653,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                     <>
                       <div className="stat">
                         <span className="stat-label">
-                          Connected patients <Users size={17} />
+                          Your patients <Users size={17} />
                         </span>
                         <div className="stat-value">{data.patients.length}</div>
                         <button
@@ -697,7 +691,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                           }
                         </div>
                         <span className="muted">
-                          Across your connected patients
+                          Across your patients
                         </span>
                       </div>
                       <div className="stat">
@@ -894,10 +888,10 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                         <h3>No prescribed exercises yet</h3>
                         <p>
                           {clinician
-                            ? "Connect a patient, then create their first prescription."
+                            ? "Add a patient by email, then create their first prescription."
                             : data.therapist
                               ? "Your physiotherapist has not assigned a plan yet."
-                              : "Connect with your physiotherapist to receive a plan."}
+                              : "Your physiotherapist adds you using your account email (" + profile.email + "), then assigns your exercises."}
                         </p>
                         <button
                           className="secondary"
@@ -910,8 +904,8 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                           }
                         >
                           {clinician
-                            ? "Connect a patient"
-                            : "Connect your care team"}
+                            ? "Add a patient"
+                            : "View account details"}
                         </button>
                       </div>
                     )}
@@ -1020,35 +1014,35 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
               <>
                 <section className="invite-banner">
                   <div>
-                    <span className="eyebrow">GROW YOUR CARE TEAM</span>
-                    <h2>Connect a patient securely.</h2>
+                    <span className="eyebrow">ADD A PATIENT</span>
+                    <h2>Add a patient by email.</h2>
                     <p>
-                      Share your care code directly. The patient signs in and
-                      confirms sharing their exercise records with you.
+                      Enter the email the patient used to create their RehabConnect
+                      account. You can then assign their exercises.
                     </p>
                   </div>
-                  <div>
-                    <code>{profile.careCode}</code>
-                    <button
-                      className="secondary"
-                      onClick={async () => {
-                        try {
-                          await navigator.clipboard.writeText(
-                            profile.careCode!,
-                          );
-                          setNotice(
-                            "Care code copied. Share it directly with your patient.",
-                          );
-                        } catch {
-                          setNotice(
-                            "Select and copy the care code shown here.",
-                          );
-                        }
-                      }}
-                    >
-                      <Copy size={15} /> Copy code
+                  <form
+                    onSubmit={async (e) => {
+                      e.preventDefault();
+                      const result = await mutate(
+                        { action: "add-patient", email: patientEmail.trim() },
+                        "Patient added. You can now assign exercises.",
+                      );
+                      if (result) setPatientEmail("");
+                    }}
+                  >
+                    <input
+                      type="email"
+                      aria-label="Patient email"
+                      placeholder="patient@example.com"
+                      value={patientEmail}
+                      onChange={(e) => setPatientEmail(e.target.value)}
+                      required
+                    />
+                    <button className="secondary" disabled={busy}>
+                      Add patient
                     </button>
-                  </div>
+                  </form>
                 </section>
                 <label className="search-label">
                   Search patient reports
@@ -1110,7 +1104,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                   <p className="empty-panel">
                     {search
                       ? "No patients match your search."
-                      : "Patients will appear here after they connect using your care code."}
+                      : "Add a patient with the email they registered with."}
                   </p>
                 )}
               </>
@@ -1631,22 +1625,10 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                   </label>
                   <SignOutButton className="secondary" beforeSignOut={saveBeforeSignOut}/>
                 </section>
-                <section className="panel">
-                  <h2>
-                    {clinician
-                      ? "Your patient connection code"
-                      : "Your physiotherapist"}
-                  </h2>
-                  {clinician ? (
-                    <>
-                      <p>
-                        Share this code directly with a patient. They must sign
-                        in and consent before you can access their records.
-                      </p>
-                      <code className="care-code">{profile.careCode}</code>
-                    </>
-                  ) : data.therapist ? (
-                    <>
+                {!clinician && (
+                  <section className="panel">
+                    <h2>Your physiotherapist</h2>
+                    {data.therapist ? (
                       <div className="care-person">
                         <span className="avatar">{data.therapist.name[0]}</span>
                         <div>
@@ -1654,92 +1636,14 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                           <p>{data.therapist.email}</p>
                         </div>
                       </div>
+                    ) : (
                       <p>
-                        This physiotherapist can view your exercise records and
-                        update your prescriptions.
+                        Your physiotherapist adds you using the email you signed up with:{" "}
+                        <strong>{profile.email}</strong>. Your exercises appear here once they assign them.
                       </p>
-                      <button
-                        className="secondary"
-                        disabled={busy || !!session}
-                        onClick={() =>
-                          void mutate(
-                            { action: "unlink" },
-                            "Care connection removed. Existing prescriptions are archived; your history is preserved.",
-                          )
-                        }
-                      >
-                        Disconnect care relationship
-                      </button>
-                      {session && (
-                        <p className="muted">
-                          Finish your session before disconnecting.
-                        </p>
-                      )}
-                    </>
-                  ) : (
-                    <>
-                      <p>
-                        Enter the care code your physiotherapist shared with
-                        you.
-                      </p>
-                      <form
-                        className="profile-form"
-                        onSubmit={async (e) => {
-                          e.preventDefault();
-                          const result = await mutate({
-                            action: "link-preview",
-                            code: careCode.trim(),
-                          });
-                          if (result) setPairing(result.therapist);
-                        }}
-                      >
-                        <label>
-                          Care code
-                          <input
-                            value={careCode}
-                            onChange={(e) => {
-                              setCareCode(e.target.value);
-                              setPairing(null);
-                            }}
-                            required
-                            autoComplete="off"
-                          />
-                        </label>
-                        <button className="primary" disabled={busy}>
-                          Find physiotherapist
-                        </button>
-                      </form>
-                      {pairing && (
-                        <div className="consent-card">
-                          <strong>{pairing.name}</strong>
-                          <p>{pairing.email}</p>
-                          <p>
-                            Connecting gives this physiotherapist access to your
-                            past and future exercise records and allows them to
-                            assign exercises.
-                          </p>
-                          <button
-                            disabled={busy}
-                            className="primary"
-                            onClick={async () => {
-                              const result = await mutate(
-                                {
-                                  action: "link",
-                                  code: careCode.trim(),
-                                  confirm: true,
-                                },
-                                "Your care team is connected.",
-                              );
-                              if (result) setPairing(null);
-                            }}
-                          >
-                            Confirm & connect
-                          </button>
-                        </div>
-                      )}
-                    </>
-                  )}
-                </section>
+                    )}
+                  </section>
+                )}
                 <section className="panel">
                   <h2>Account security and records</h2>
                   <p>
@@ -1748,7 +1652,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                     access is checked on the server for every request.
                   </p>
                   <p>
-                    Only you and your currently connected physiotherapist can
+                    Only you and the physiotherapist who added you can
                     access your exercise records. Role changes are not available
                     through the workspace.
                   </p>

@@ -77,11 +77,16 @@ for (const [path,id] of [["/patient",patient],["/physiotherapist",doctor],["/log
   const response=await fetch(origin+path,{headers:id?{Cookie:sessions.get(id)}:{}});
   assert.equal(response.status,200); checks++;
 }
-const code = (await call(doctor)).profile.careCode;
+// The physiotherapist adds a patient by email; the patient takes no linking step.
 assert.equal((await call(doctor)).patients.length, 0);
-await call(patient, { action: "link-preview", code });
-await call(patient, { action: "link", code }, 400);
-await call(patient, { action: "link", code, confirm: true });
+await call(patient, { action: "add-patient", email: otherPatient + "@example.test" }, 403);
+await call(doctor, { action: "add-patient", email: "nobody-" + suffix + "@example.test" }, 404);
+await call(doctor, { action: "add-patient", email: "not-an-email" }, 400);
+await call(doctor, { action: "add-patient", email: doctor + "@example.test" }, 404);
+await call(doctor, { action: "add-patient", email: (patient + "@example.test").toUpperCase() });
+await call(doctor, { action: "add-patient", email: patient + "@example.test" });
+await call(outsider, { action: "add-patient", email: patient + "@example.test" }, 409);
+await call(patient, { action: "link", code: "0".repeat(32), confirm: true }, 400);
 assert.equal((await call(doctor)).patients[0].id, (await call(patient)).profile.id);
 const prescription = {
   action: "prescribe",
@@ -146,7 +151,7 @@ await call(
   { ...update, revision: 1, heart: [{ at: 0, bpm: 81 }] },
   400,
 );
-await call(patient, { action: "unlink" }, 409);
+await call(patient, { action: "unlink" }, 400);
 const incomplete = await call(patient, {
   ...update,
   revision: 1,
@@ -213,12 +218,11 @@ for (const exercise of selectionCases) {
   assert.equal(saved.reps, 1);
   assert.equal(saved.status, "incomplete");
 }
-await call(patient, { action: "unlink" });
-assert.equal((await call(doctor)).patients.length, 0);
-assert.equal((await call(doctor)).sessions.length, 0);
+assert.equal((await call(doctor)).patients.length, 1);
+assert.equal((await call(outsider)).sessions.length, 0);
 const final = await call(patient);
 assert.equal(final.sessions.length, 6);
-assert.ok(final.prescriptions.every((p) => p.active === 0));
+assert.equal(final.therapist.id, (await call(doctor)).profile.id);
 
 const cookieBeforeLogout=sessions.get(patient);
 const logout=await fetch(origin+"/api/auth",{method:"POST",headers:{"Content-Type":"application/json",Origin:origin,Cookie:cookieBeforeLogout},body:JSON.stringify({action:"logout"})});

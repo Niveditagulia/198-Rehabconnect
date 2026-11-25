@@ -184,74 +184,33 @@ export async function POST(request: Request) {
         .run();
       return json({ ok: true });
     }
-    if (action === "link-preview" || action === "link") {
-      if (profile.role !== "patient")
-        throw new HttpError(
-          403,
-          "Only patients can link to a physiotherapist.",
-        );
-      if (profile.therapistId)
-        throw new HttpError(
-          409,
-          "You are already connected to a physiotherapist.",
-        );
-      const code = z
+    if (action === "add-patient") {
+      if (profile.role !== "physiotherapist")
+        throw new HttpError(403, "Only physiotherapists can add patients.");
+      const email = z
         .string()
-        .regex(
-          /^[a-f0-9]{32}$/,
-          "Enter the complete care code from your physiotherapist.",
-        )
-        .parse(input.code);
-      const therapist = await db
+        .trim()
+        .toLowerCase()
+        .email("Enter the patient's email address.")
+        .parse(input.email);
+      const patient = await db
         .prepare(
-          "SELECT id,name,email FROM profiles WHERE care_code=? AND role='physiotherapist'",
+          `SELECT id,therapist_id AS "therapistId" FROM profiles WHERE lower(email)=? AND role='patient'`,
         )
-        .bind(code)
-        .first<{ id: string; name: string; email: string }>();
-      if (!therapist)
+        .bind(email)
+        .first<{ id: string; therapistId: string | null }>();
+      if (!patient)
         throw new HttpError(
           404,
-          "Care code not found. Check it with your physiotherapist.",
+          "No patient account uses that email. Ask the patient to register first.",
         );
-      if (action === "link-preview") return json({ therapist });
-      if (input.confirm !== true)
-        throw new HttpError(
-          400,
-          "Confirm consent to share your exercise records.",
-        );
+      if (patient.therapistId === profile.id) return json({ ok: true });
+      if (patient.therapistId)
+        throw new HttpError(409, "This patient already has a physiotherapist.");
       await db
-        .prepare(
-          "UPDATE profiles SET therapist_id=? WHERE id=? AND therapist_id IS NULL",
-        )
-        .bind(therapist.id, profile.id)
+        .prepare("UPDATE profiles SET therapist_id=? WHERE id=? AND therapist_id IS NULL")
+        .bind(profile.id, patient.id)
         .run();
-      return json({ ok: true });
-    }
-    if (action === "unlink") {
-      if (profile.role !== "patient")
-        throw new HttpError(
-          403,
-          "Only patients can disconnect their care relationship.",
-        );
-      const open = await db
-        .prepare(
-          "SELECT id FROM exercise_sessions WHERE patient_id=? AND status IN ('active','paused')",
-        )
-        .bind(profile.id)
-        .first();
-      if (open)
-        throw new HttpError(
-          409,
-          "Finish your current session before disconnecting.",
-        );
-      await db.batch([
-        db
-          .prepare("UPDATE profiles SET therapist_id=NULL WHERE id=?")
-          .bind(profile.id),
-        db
-          .prepare("UPDATE prescriptions SET active=0 WHERE patient_id=?")
-          .bind(profile.id),
-      ]);
       return json({ ok: true });
     }
     if (
