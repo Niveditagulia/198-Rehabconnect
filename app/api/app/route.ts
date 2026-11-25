@@ -1,3 +1,4 @@
+import { creditedSets } from "../../../lib/set-progress";
 import { getDatabase, type Database } from "../../../lib/database";
 import { getUser } from "../../../lib/auth";
 import { sameOrigin } from "../../../lib/request-origin";
@@ -14,7 +15,7 @@ const profileCols =
 const prescriptionCols =
   `id,patient_id AS "patientId",therapist_id AS "therapistId",name,instructions,reps,sets,minutes,active,created_at AS "createdAt"`;
 const sessionCols =
-  `id,patient_id AS "patientId",prescription_id AS "prescriptionId",exercise,instructions,target,reps,seconds,status,started_at AS "startedAt",updated_at AS "updatedAt",finished_at AS "finishedAt",heart,connection,revision`;
+  `id,patient_id AS "patientId",prescription_id AS "prescriptionId",exercise,instructions,target,set_plan AS "setPlan",reps,seconds,status,started_at AS "startedAt",updated_at AS "updatedAt",finished_at AS "finishedAt",heart,connection,revision`;
 class HttpError extends Error {
   constructor(
     public status: number,
@@ -31,9 +32,10 @@ const json = (body: unknown, status = 200) =>
       "X-Content-Type-Options": "nosniff",
     },
   });
+type StoredSession = Omit<ExerciseSession, "setPlan" | "heart"> & { setPlan: string | null; heart: string };
 const parseSession = (
-  s: ExerciseSession & { heart: string },
-): ExerciseSession => ({ ...s, heart: JSON.parse(s.heart) });
+  s: StoredSession,
+): ExerciseSession => ({ ...s, setPlan: s.setPlan ? JSON.parse(s.setPlan) : null, heart: JSON.parse(s.heart) });
 type AccountRole = "patient" | "physiotherapist";
 const roleHeader = "x-rehabconnect-role";
 function requestedRole(request: Request): AccountRole {
@@ -120,7 +122,7 @@ export async function GET(request: Request) {
           `SELECT ${sessionCols} FROM exercise_sessions WHERE ${condition} ORDER BY started_at DESC LIMIT 1000`,
         )
         .bind(profile.id)
-        .all<ExerciseSession & { heart: string }>(),
+        .all<StoredSession>(),
       profile.therapistId
         ? db
             .prepare("SELECT id,name,email FROM profiles WHERE id=?")
@@ -332,7 +334,7 @@ export async function POST(request: Request) {
           `SELECT ${sessionCols} FROM exercise_sessions WHERE id=? AND patient_id=?`,
         )
         .bind(id, profile.id)
-        .first<ExerciseSession & { heart: string }>();
+        .first<StoredSession>();
       if (existing) return json({ session: parseSession(existing) });
       const open = await db
         .prepare(
@@ -355,7 +357,7 @@ export async function POST(request: Request) {
       const now = Date.now();
       await db
         .prepare(
-          "INSERT INTO exercise_sessions (id,patient_id,prescription_id,exercise,instructions,target,status,started_at,updated_at) SELECT ?,?,?,?,?,CAST(? AS BIGINT),'paused',CAST(? AS BIGINT),CAST(? AS BIGINT) WHERE NOT EXISTS (SELECT 1 FROM exercise_sessions WHERE patient_id=? AND status IN ('active','paused')) ON CONFLICT DO NOTHING",
+          "INSERT INTO exercise_sessions (id,patient_id,prescription_id,exercise,instructions,target,set_plan,status,started_at,updated_at) SELECT ?,?,?,?,?,CAST(? AS BIGINT),CAST(? AS TEXT),'paused',CAST(? AS BIGINT),CAST(? AS BIGINT) WHERE NOT EXISTS (SELECT 1 FROM exercise_sessions WHERE patient_id=? AND status IN ('active','paused')) ON CONFLICT DO NOTHING",
         )
         .bind(
           id,
@@ -364,6 +366,8 @@ export async function POST(request: Request) {
           p.name,
           p.instructions,
           p.reps * p.sets,
+          // Every new session is judged by sets; an outdated client cannot opt out.
+          JSON.stringify({ repsPerSet: p.reps, counts: [0] }),
           now,
           now,
           profile.id,
@@ -374,7 +378,7 @@ export async function POST(request: Request) {
           `SELECT ${sessionCols} FROM exercise_sessions WHERE id=? AND patient_id=?`,
         )
         .bind(id, profile.id)
-        .first<ExerciseSession & { heart: string }>();
+        .first<StoredSession>();
       if (!session)
         throw new HttpError(
           409,
@@ -391,6 +395,7 @@ export async function POST(request: Request) {
       const data = z
         .object({
           id: uuid,
+          setCounts: z.array(z.number().int().min(0).max(10000)).min(1).max(10001).optional(),
           revision: z.number().int().min(0),
           reps: z.number().int().min(0).max(10000),
           seconds: z.number().int().min(0).max(86400),
@@ -411,7 +416,7 @@ export async function POST(request: Request) {
           `SELECT ${sessionCols} FROM exercise_sessions WHERE id=? AND patient_id=?`,
         )
         .bind(data.id, profile.id)
-        .first<ExerciseSession & { heart: string }>();
+        .first<StoredSession>();
       if (!s) throw new HttpError(404, "Session not found.");
       if (s.finishedAt !== null) {
         if (
@@ -450,16 +455,30 @@ export async function POST(request: Request) {
           400,
           "Saved heart-rate readings cannot be changed.",
         );
+      const plan = parseSession(s).setPlan;
+      if (plan) {
+        const counts = data.setCounts;
+        if (!counts) throw new HttpError(400, "Reload this page to save per-set progress.");
+        const total = (values: number[]) => values.reduce((sum, n) => sum + n, 0);
+        const last = plan.counts.length - 1;
+        if (counts.length < plan.counts.length || counts[last] < plan.counts[last] ||
+            plan.counts.slice(0, last).some((n, i) => counts[i] !== n) ||
+            total(counts) - total(plan.counts) > data.reps - s.reps ||
+            counts.slice(0, -1).some(n => n === 0))
+          throw new HttpError(400, "Set counts do not match the recorded progress.");
+        plan.counts = counts;
+      }
+      const targetMet = plan ? creditedSets(plan, s.target) * plan.repsPerSet >= s.target : data.reps >= s.target;
       const status =
         data.status === "finished"
-          ? data.reps >= s.target
+          ? targetMet
             ? "completed"
             : "incomplete"
           : data.status;
       const now = Date.now();
       const result = await db
         .prepare(
-          "UPDATE exercise_sessions SET reps=?,seconds=?,status=?,connection=?,heart=?,updated_at=?,finished_at=?,revision=revision+1 WHERE id=? AND patient_id=? AND revision=?",
+          "UPDATE exercise_sessions SET reps=?,seconds=?,status=?,connection=?,heart=?,set_plan=?,updated_at=?,finished_at=?,revision=revision+1 WHERE id=? AND patient_id=? AND revision=?",
         )
         .bind(
           data.reps,
@@ -467,6 +486,7 @@ export async function POST(request: Request) {
           status,
           data.connection,
           JSON.stringify(data.heart),
+          plan ? JSON.stringify(plan) : null,
           now,
           data.status === "finished" ? now : null,
           data.id,
@@ -484,7 +504,7 @@ export async function POST(request: Request) {
           `SELECT ${sessionCols} FROM exercise_sessions WHERE id=? AND patient_id=?`,
         )
         .bind(data.id, profile.id)
-        .first<ExerciseSession & { heart: string }>();
+        .first<StoredSession>();
       return json({ session: parseSession(saved!) });
     }
     throw new HttpError(400, "Unknown operation.");

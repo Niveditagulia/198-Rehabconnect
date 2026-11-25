@@ -106,6 +106,8 @@ const created = await call(
   201,
 );
 assert.equal(created.session.target, 2);
+// The server snapshots a set plan even when the client does not ask for one (outdated tabs cannot opt out).
+assert.deepEqual(created.session.setPlan?.counts, [0]);
 await call(patient, {
   action: "start",
   id: sessionId,
@@ -126,6 +128,7 @@ const update = {
   id: sessionId,
   revision: 0,
   reps: 1,
+  setCounts: [1],
   seconds: 0,
   heart: [{ at: 0, bpm: 80 }],
   status: "paused",
@@ -134,6 +137,7 @@ const update = {
 await call(otherPatient, update, 404);
 await call(doctor, update, 403);
 await call(patient, { ...update, heart: [{ at: 0, bpm: -1 }] }, 400);
+await call(patient, { ...update, setCounts: undefined }, 400);
 await call(patient, update);
 await call(patient, update, 409);
 await call(patient, { ...update, revision: 1, reps: 0 }, 400);
@@ -169,6 +173,7 @@ const completed = await call(patient, {
   id: second,
   revision: 0,
   reps: 2,
+  setCounts: [2],
   status: "finished",
 });
 assert.equal(completed.session.target, 2);
@@ -181,6 +186,19 @@ for (const exercise of selectionCases) {
   await call(doctor, { ...prescription, ...exercise });
 }
 const plan = (await call(patient)).prescriptions;
+await call(doctor, { ...prescription, name: "Four sets test", reps: 8, sets: 4 });
+const four = (await call(patient)).prescriptions.find(p => p.name === "Four sets test");
+for (const [counts, expected] of [[[32], "incomplete"], [[8, 8, 8, 8], "completed"]]) {
+  const id = crypto.randomUUID();
+  const { session } = await call(patient, { action: "start", id, prescriptionId: four.id }, 201);
+  assert.deepEqual(session.setPlan, { repsPerSet: 8, counts: [0] });
+  const save = { ...update, id, revision: 0, seconds: 0, heart: [], status: "finished", reps: 32 };
+  await call(patient, { ...save, setCounts: [32, 8] }, 400);
+  await call(patient, { ...save, setCounts: counts });
+  const record = (await call(doctor)).sessions.find(s => s.id === id);
+  assert.deepEqual(record.setPlan.counts, counts);
+  assert.equal(record.status, expected);
+}
 for (const exercise of selectionCases) {
   const selected = plan.find((item) => item.name === exercise.name);
   assert.ok(selected);
@@ -188,7 +206,7 @@ for (const exercise of selectionCases) {
   const { session } = await call(patient, { action: "start", id, prescriptionId: selected.id }, 201);
   assert.equal(session.exercise, exercise.name);
   assert.equal(session.target, exercise.reps * exercise.sets);
-  await call(patient, { ...update, id, revision: 0, reps: 1, seconds: 3, heart: [], status: "finished" });
+  await call(patient, { ...update, id, revision: 0, reps: 1, setCounts: [1], seconds: 3, heart: [], status: "finished" });
   const saved = (await call(patient)).sessions.find((item) => item.id === id);
   assert.equal(saved.prescriptionId, selected.id);
   assert.equal(saved.exercise, exercise.name);
@@ -199,7 +217,7 @@ await call(patient, { action: "unlink" });
 assert.equal((await call(doctor)).patients.length, 0);
 assert.equal((await call(doctor)).sessions.length, 0);
 const final = await call(patient);
-assert.equal(final.sessions.length, 4);
+assert.equal(final.sessions.length, 6);
 assert.ok(final.prescriptions.every((p) => p.active === 0));
 
 const cookieBeforeLogout=sessions.get(patient);

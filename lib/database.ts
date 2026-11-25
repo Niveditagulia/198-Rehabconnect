@@ -32,6 +32,23 @@ class Postgres {
 let postgres:Postgres | undefined;
 let client: Client | undefined;
 let initialized: Promise<unknown> | undefined;
+async function ensureSetPlanColumn(db: Client | Postgres) {
+  const hasColumn = async () => {
+    const sql = db instanceof Postgres
+      ? "SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='exercise_sessions' AND column_name='set_plan'"
+      : "SELECT 1 FROM pragma_table_info('exercise_sessions') WHERE name='set_plan'";
+    return (await db.execute({sql, args: []})).rows.length > 0;
+  };
+  if (await hasColumn()) return;
+  try {
+    const sql = db instanceof Postgres
+      ? 'ALTER TABLE exercise_sessions ADD COLUMN IF NOT EXISTS set_plan TEXT'
+      : 'ALTER TABLE exercise_sessions ADD COLUMN set_plan TEXT';
+    await db.execute({sql, args: []});
+  } catch (error) {
+    if (!await hasColumn()) throw error;
+  }
+}
 export function databaseClient() {
   if (!client) {
     const url = process.env.TURSO_DATABASE_URL;
@@ -59,11 +76,13 @@ export async function getDatabase() {
         ...(isSupabasePooler ? {ssl: {ca: supabaseCa, rejectUnauthorized: true}} : {}),
       }));
     }
+    if (!initialized) initialized = ensureSetPlanColumn(postgres).catch(error => { initialized = undefined; throw error; });
+    await initialized;
     return new Database(postgres);
   }
   if (process.env.VERCEL) throw new Error('Set POSTGRES_URL to the Supabase transaction pooler URL.');
   const client = databaseClient();
-  if (!initialized) initialized = client.batch(schema, 'write').catch(error => { initialized = undefined; throw error; });
+  if (!initialized) initialized = client.batch(schema, 'write').then(() => ensureSetPlanColumn(client)).catch(error => { initialized = undefined; throw error; });
   await initialized;
   return new Database(client);
 }

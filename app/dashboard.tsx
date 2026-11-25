@@ -24,6 +24,7 @@ import {
   Copy,
   Dumbbell,
 } from "lucide-react";
+import { advanceSets, creditedSets, resumePlan, FRESH_SET_MESSAGE } from "../lib/set-progress";
 import Figure from "../components/exercise-figure";
 import SignOutButton from "./signout-button";
 import { useUsbSensor } from "../lib/use-usb-sensor";
@@ -65,6 +66,15 @@ async function api(body?: unknown) {
 }
 const duration = (seconds: number) =>
   `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+function setSummary(s: ExerciseSession) {
+  return s.setPlan
+    ? creditedSets(s.setPlan, s.target) + " / " + (s.target / s.setPlan.repsPerSet) + " sets completed"
+    : s.reps + " / " + s.target + " reps";
+}
+function progressPercent(s: ExerciseSession) {
+  if (!s.setPlan) return Math.round(100 * s.reps / s.target);
+  return Math.round(100 * creditedSets(s.setPlan, s.target) / (s.target / s.setPlan.repsPerSet));
+}
 const label = (s: ExerciseSession) =>
   isOpen(s)
     ? Date.now() - s.updatedAt > 12000
@@ -75,7 +85,7 @@ const label = (s: ExerciseSession) =>
         ? "In progress"
         : "Paused"
     : s.status === "completed"
-      ? s.reps > s.target
+      ? !s.setPlan && s.reps > s.target
         ? "Completed · above target"
         : "Completed"
       : "Incomplete";
@@ -98,6 +108,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
     [session, setSession] = useState<ExerciseSession | null>(null),
     [running, setRunning] = useState(false),
     [syncError, setSyncError] = useState(""),
+    [syncConflict, setSyncConflict] = useState(false),
     [lastSaved, setLastSaved] = useState(0),
     [largeText, setLargeText] = useState(false),
     [pairing, setPairing] = useState<{
@@ -111,6 +122,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
     refreshSequence = useRef(0),
     run = useRef(false),
     baseline = useRef<Reading | null>(null),
+    lastTrackedPacket = useRef<Reading | null>(null),
     [finishing, setFinishing] = useState(false),
     lock = useRef<Promise<void> | null>(null),
     loaded = useRef(false);
@@ -130,7 +142,12 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
     const delta = counterDelta(previous, next);
     if (delta === null) { holdSession(); return; }
     baseline.current = next;
-    if (delta) updateSession(s => ({...s, reps: s.reps + delta}));
+    lastTrackedPacket.current = next;
+    const jump = next.setId - previous.setId;
+    if (delta || jump) updateSession(s => ({
+      ...s, reps: s.reps + delta,
+      setPlan: s.setPlan ? advanceSets(s.setPlan, delta, jump, next.setReps) : null,
+    }));
     if (previous.state !== "paused" && next.state === "paused") void sync();
   }, holdSession);
   const fresh = usb.connected && !usb.stale && !!usb.reading;
@@ -146,6 +163,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
         const open = next.sessions.find(isOpen);
         if (open) {
           const firstLoad = !loaded.current;
+          if (current.current?.id !== open.id) lastTrackedPacket.current = null;
           setSession(open);
           current.current = open;
           setRunning(false);
@@ -201,6 +219,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
             id: snap.id,
             revision: snap.revision,
             reps: snap.reps,
+            setCounts: snap.setPlan?.counts,
             seconds: snap.seconds,
             heart: snap.heart,
             status: finish
@@ -212,8 +231,10 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
           });
           setLastSaved(Date.now());
           setSyncError("");
+          setSyncConflict(false);
           if (finish) {
             writesSession.current = false;
+            lastTrackedPacket.current = null;
             current.current = null;
             setSession(null);
             setFinishing(false);
@@ -233,6 +254,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
           failed = true;
           setSyncError((e as Error).message);
           if (e instanceof AppError && e.status === 409) {
+            setSyncConflict(true);
             writesSession.current = false;
             holdSession();
             setFinishing(false);
@@ -289,17 +311,25 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
       setTab("Device connection");
       return;
     }
+    if (usb.snapshot()?.setReps) {
+      setPendingExerciseId(p.id);
+      setTab("Device connection");
+      setError(FRESH_SET_MESSAGE.replace("continue", "start"));
+      return;
+    }
     setBusy(true);
     try {
       const result = await api({
         action: "start",
+        trackSets: true,
         id: crypto.randomUUID(),
         prescriptionId: p.id,
       });
       const startPacket = usb.snapshot();
       setPendingExerciseId("");
       writesSession.current = true;
-      baseline.current = startPacket?.state === "running" ? startPacket : null;
+      baseline.current = startPacket?.state === "running" && startPacket.setReps === 0 ? startPacket : null;
+      lastTrackedPacket.current = baseline.current;
       current.current = result.session;
       setSession(result.session);
       run.current = !!baseline.current;
@@ -322,7 +352,12 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
   }
   function resume() {
     const packet = usb.snapshot();
-    if (finishing || packet?.state !== "running") return;
+    if (finishing || packet?.state !== "running" || !current.current) return;
+    const decision = resumePlan(current.current.setPlan, lastTrackedPacket.current, packet);
+    if (!decision.ok) { setError(decision.reason); return; }
+    setError("");
+    updateSession(s => ({...s, setPlan: decision.plan}));
+    lastTrackedPacket.current = packet;
     baseline.current = packet;
     writesSession.current = true;
     run.current = true;
@@ -382,7 +417,15 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
           {
             patient: actualPatient?.name,
             prescriptions: plan,
-            sessions: filtered,
+            sessions: filtered.map((s) => ({
+              ...s,
+              result: setSummary(s),
+              completionBasis: s.setPlan
+                ? "Sets: a set counts when one tracker set reaches the prescribed reps"
+                : "Total reps (session recorded before per-set tracking)",
+              setsCredited: s.setPlan ? creditedSets(s.setPlan, s.target) : null,
+              setsPrescribed: s.setPlan ? s.target / s.setPlan.repsPerSet : null,
+            })),
           },
           null,
           2,
@@ -955,7 +998,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                         </small>
                       </div>
                       <span>
-                        {s.reps}/{s.target} reps
+                        {setSummary(s)}
                       </span>
                       <span
                         className={
@@ -1233,12 +1276,12 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                           .map((s) => (
                             <div key={s.id}>
                               <span>
-                                {s.reps}/{s.target}
+                                {setSummary(s)}
                               </span>
                               <i
                                 style={{
                                   height:
-                                    Math.min(100, (s.reps / s.target) * 100) +
+                                    Math.min(100, progressPercent(s)) +
                                     "px",
                                 }}
                               />
@@ -1261,7 +1304,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                       <h2>Sensor measurement</h2>
                       <div className="chart-empty">
                         <Activity size={24} />
-                        <p>The Arduino counts changes in acceleration. Session completion compares total counted reps with the prescribed target. It does not verify set structure, distance or exercise technique.</p>
+                        <p>The Arduino counts changes in acceleration. A set earns one credit when it reaches its prescribed reps. The black button separates sets. Earlier sessions may show only total reps.</p>
                       </div>
                     </section>
                   </div>
@@ -1282,9 +1325,9 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                         </small>
                       </div>
                       <span>
-                        {s.reps}/{s.target} reps
+                        {setSummary(s)}
                         <small>
-                          {Math.round((s.reps / s.target) * 100)}% of target
+                          {progressPercent(s)}% of target
                         </small>
                       </span>
                       <span
@@ -1334,8 +1377,9 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                   <p>{session.instructions}</p>
                   {syncError && (
                     <div className="warning" role="alert">
+                      {syncConflict ? <>{syncError} <button onClick={() => window.location.reload()}>Reload</button></> : <>
                       {syncError} Your current readings remain on this page.{" "}
-                      <button disabled={busy} onClick={() => finishing ? void finish() : void sync()}>Retry save</button>
+                      <button disabled={busy} onClick={() => finishing ? void finish() : void sync()}>Retry save</button></>}
                     </div>
                   )}
                   {!fresh && (
@@ -1356,37 +1400,22 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                   <div className="live-layout">
                     <div className="rep-panel">
                       <div className="live-reps">
-                        {session.reps}
-                        <small> / {session.target}</small>
+                        {session.setPlan?.counts.at(-1) ?? session.reps}
+                        <small> / {session.setPlan?.repsPerSet ?? session.target}</small>
                       </div>
-                      <p className="center-note">
-                        Session repetitions ·{" "}
-                        {Math.round((session.reps / session.target) * 100)}% of
-                        target
-                      </p>
-                      <div className="thin-progress">
-                        <i
-                          style={{
-                            width:
-                              Math.min(
-                                100,
-                                (session.reps / session.target) * 100,
-                              ) + "%",
-                          }}
-                        />
-                      </div>
-                      {session.reps >= session.target && (
-                        <div className="notice">
-                          {session.reps === session.target
-                            ? "Target reached. You can finish your exercise."
-                            : "Above the prescribed target. Pause or finish your session."}
-                        </div>
+                      <p className="center-note">{session.setPlan ? "Reps this set" : "Session repetitions"}</p>
+                      {session.setPlan && <p className="center-note">{setSummary(session)} · {session.reps} total reps</p>}
+                      <div className="thin-progress"><i style={{ width: Math.min(100, progressPercent(session)) + "%" }} /></div>
+                      {(session.setPlan ? creditedSets(session.setPlan, session.target) * session.setPlan.repsPerSet >= session.target : session.reps >= session.target) ? (
+                        <div className="notice">Target reached. You can finish your exercise.</div>
+                      ) : session.setPlan && session.setPlan.counts.at(-1)! >= session.setPlan.repsPerSet && (
+                        <div className="notice">Set credited. Press black to pause, then press again to begin the next set.</div>
                       )}
                       <div className="live-metrics">
                         <div>
                           <Activity size={19} />
                           <strong>
-                            {fresh ? usb.reading?.setReps : "—"} <small>current set</small>
+                            {fresh ? usb.reading?.setReps : "—"} <small>on tracker OLED</small>
                           </strong>
                         </div>
                         <div>
@@ -1505,7 +1534,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                     </div>
                   )}
                   <p className="muted">
-                    The current set matches the OLED. Your session total includes reps from each set after you start tracking.
+                    Start each exercise with the tracker at 0 reps (press black twice to begin a fresh set). The website set then matches the OLED, and each tracker set earns at most one set credit.
                   </p>
                 </section>
                 <section className="panel">
@@ -1943,10 +1972,10 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
               <div className="result-grid">
                 <div>
                   <strong>
-                    {selected.reps}/{selected.target}
+                    {setSummary(selected)}
                   </strong>
                   <span>
-                    {Math.round((selected.reps / selected.target) * 100)}% of
+                    {progressPercent(selected)}% of
                     target
                   </span>
                 </div>
@@ -1955,6 +1984,7 @@ export default function Dashboard({role}: {role: "patient" | "physiotherapist"})
                   <span>exercise time</span>
                 </div>
               </div>
+              {selected.setPlan && <p>{selected.reps} total reps · {selected.setPlan.repsPerSet} prescribed per set · Recorded set reps: {selected.setPlan.counts.join(", ")}</p>}
               <p className="muted">
                 Equipment movement count · Updated{" "}
                 {new Date(selected.updatedAt).toLocaleTimeString()}

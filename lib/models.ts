@@ -1,7 +1,7 @@
 export type Profile={id:string;name:string;email:string;role:'patient'|'physiotherapist';careCode:string|null;therapistId:string|null;createdAt:number};
 export type Prescription={id:string;patientId:string;therapistId:string;name:string;instructions:string;reps:number;sets:number;minutes:number;active:number;createdAt:number};
 export type HeartSample={at:number;bpm:number};
-export type ExerciseSession={id:string;patientId:string;prescriptionId:string;exercise:string;instructions:string;target:number;reps:number;seconds:number;status:'active'|'paused'|'completed'|'incomplete';startedAt:number;updatedAt:number;finishedAt:number|null;heart:HeartSample[];connection:'connected'|'disconnected';revision:number};
+export type ExerciseSession={id:string;patientId:string;prescriptionId:string;exercise:string;instructions:string;target:number;setPlan:import('./set-progress').SetPlan|null;reps:number;seconds:number;status:'active'|'paused'|'completed'|'incomplete';startedAt:number;updatedAt:number;finishedAt:number|null;heart:HeartSample[];connection:'connected'|'disconnected';revision:number};
 export type AppData={profile:Profile|null;activeRole:'patient'|'physiotherapist';identity:{name:string;email:string};patients:Profile[];therapist:Pick<Profile,'id'|'name'|'email'>|null;prescriptions:Prescription[];sessions:ExerciseSession[]};
 export const catalog=[
  {name:'Ball squat',area:'Lower body · Vertical movement',reps:10,sets:2,minutes:5,instructions:'Secure the sensor to the exercise ball. Perform each squat with the setup and range demonstrated by your physiotherapist. The tracker counts changes in the ball’s acceleration.'},
